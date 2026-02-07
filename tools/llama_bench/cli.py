@@ -292,9 +292,12 @@ def format_results_table(results: List[benchmark.BenchmarkResult]) -> str:
         ("c_tok", lambda r: "n/a" if r.completion_tokens is None else str(r.completion_tokens)),
         ("sec", lambda r: f"{r.duration_s:.2f}"),
         ("tok/s", lambda r: "n/a" if r.tokens_per_s is None else f"{r.tokens_per_s:.1f}"),
+        ("cpu%", lambda r: "n/a" if r.avg_cpu_percent is None else f"{r.avg_cpu_percent:.1f}"),
+        ("mem%", lambda r: "n/a" if r.avg_mem_percent is None else f"{r.avg_mem_percent:.1f}"),
         ("gpuW", lambda r: "n/a" if r.avg_gpu_power_w is None else f"{r.avg_gpu_power_w:.1f}"),
         ("cap%", lambda r: "n/a" if r.avg_gpu_power_percent_of_limit is None else f"{r.avg_gpu_power_percent_of_limit:.1f}"),
-        ("Wh", lambda r: "n/a" if r.gpu_energy_wh is None else f"{r.gpu_energy_wh:.3f}"),
+        ("cpu_Wh", lambda r: "n/a" if r.cpu_energy_wh is None else f"{r.cpu_energy_wh:.3f}"),
+        ("gpu_Wh", lambda r: "n/a" if r.gpu_energy_wh is None else f"{r.gpu_energy_wh:.3f}"),
         ("tok/s/W", lambda r: "n/a" if r.tokens_per_s_per_w is None else f"{r.tokens_per_s_per_w:.3f}"),
     ]
 
@@ -548,6 +551,8 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     print(f"  avg gpu power: {utils.format_number(summary.avg_gpu_power_w, 'W', precision=1)}")
     if summary.tokens_per_s is not None:
         print(f"  tokens/s: {summary.tokens_per_s:.2f}")
+    if summary.tokens_per_s_per_w is not None:
+        print(f"  tokens/s/W: {summary.tokens_per_s_per_w:.4f}")
 
     if args.json_out:
         payload = {
@@ -558,6 +563,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
                 "avg_gpu_util": summary.avg_gpu_util,
                 "avg_gpu_power_w": summary.avg_gpu_power_w,
                 "tokens_per_s": summary.tokens_per_s,
+                "tokens_per_s_per_w": summary.tokens_per_s_per_w,
             },
             "samples": [sample.__dict__ for sample in sampler.samples],
         }

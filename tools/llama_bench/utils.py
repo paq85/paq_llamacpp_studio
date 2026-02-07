@@ -189,6 +189,7 @@ def wait_for_port(host: str, port: int, timeout_s: float = 30.0) -> bool:
 
 def check_port_available(port: int) -> Tuple[bool, Optional[str]]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind(("0.0.0.0", port))
         return True, None
@@ -290,6 +291,7 @@ class SampleSummary:
     tokens_per_s: Optional[float] = None
     tokens_total_delta: Optional[float] = None
     tokens_total_end: Optional[float] = None
+    tokens_per_s_per_w: Optional[float] = None
 
     # Energy/power (best-effort)
     cpu_energy_j: Optional[float] = None
@@ -570,6 +572,7 @@ def summarize_samples(
             tokens_per_s=None,
             tokens_total_delta=None,
             tokens_total_end=None,
+            tokens_per_s_per_w=None,
         )
 
     data = samples
@@ -637,6 +640,9 @@ def summarize_samples(
         if v0 is not None and v1 is not None and t1 > t0:
             tokens_total_delta = (v1 - v0)
             tokens_per_s = tokens_total_delta / (t1 - t0)
+    tokens_per_s_per_w = None
+    if tokens_per_s and avg_gpu_power and avg_gpu_power > 0:
+        tokens_per_s_per_w = tokens_per_s / avg_gpu_power
 
     # Energy/power (best-effort)
     cpu_energy_uj = None
@@ -702,6 +708,7 @@ def summarize_samples(
         tokens_per_s=tokens_per_s,
         tokens_total_delta=tokens_total_delta,
         tokens_total_end=tokens_total_end,
+        tokens_per_s_per_w=tokens_per_s_per_w,
         cpu_energy_j=cpu_energy_j,
         cpu_energy_wh=cpu_energy_wh,
         cpu_power_w=cpu_power_w,
@@ -961,10 +968,17 @@ def format_sample_line(sample: Sample) -> str:
         gpu_power = format_number(avg_or_none(power_vals), "W", precision=1)
         gpu_cap = format_percent(avg_or_none(cap_vals))
     tokens = format_number(sample.tokens_total, precision=0)
+    tokens_per_w = "n/a"
+    if sample.gpus:
+        power_vals = [g.power_w for g in sample.gpus if g.power_w is not None and g.power_w > 0]
+        if power_vals and sample.tokens_total is not None:
+            avg_power = avg_or_none(power_vals)
+            if avg_power and avg_power > 0:
+                tokens_per_w = format_number(sample.tokens_total / avg_power, precision=2)
     return (
         f"cpu {cpu} mem {mem} load1 {load} "
         f"proc_cpu {proc_cpu} proc_rss {proc_rss} "
-        f"gpu {gpu_util} gpu_pwr {gpu_power} gpu_cap {gpu_cap} tokens {tokens}"
+        f"gpu {gpu_util} gpu_pwr {gpu_power} gpu_cap {gpu_cap} tokens {tokens} tok_per_w {tokens_per_w}"
     )
 
 

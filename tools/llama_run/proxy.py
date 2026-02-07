@@ -1,4 +1,5 @@
 import json
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -6,6 +7,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 
 from tools.llama_bench import utils
+
+
+class ReusableTCPServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, 'SO_REUSEPORT'):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        super().server_bind()
 
 
 def _is_hop_header(name: str) -> bool:
@@ -187,7 +196,7 @@ class LlamaMeterProxy:
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
-        httpd = ThreadingHTTPServer((self.host, int(self.port)), ProxyHandler)
+        httpd = ReusableTCPServer((self.host, int(self.port)), ProxyHandler)
         httpd.backend = (self.backend_host, int(self.backend_port))  # type: ignore[attr-defined]
         httpd.meter = self.meter  # type: ignore[attr-defined]
         self._httpd = httpd
@@ -205,7 +214,9 @@ class LlamaMeterProxy:
         if self._httpd:
             try:
                 self._httpd.shutdown()
+                self._httpd.server_close()
             except Exception:
                 pass
         if self._thread:
             self._thread.join(timeout=2.0)
+        time.sleep(0.2)

@@ -1,0 +1,13 @@
+# Python dependencies for llama.cpp Studio with GLM-4.7 Flash
+
+# Core dependencies
+psutil>=5.9.8
+requests>=2.31.0
+
+# PyTorch for GLM-4.7 Flash integration (if needed for inference)
+# torch>=2.0.0
+
+# Additional testing dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+httpx>=0.24.0

@@ -332,6 +332,8 @@ def run_autotune(
                 "n/a" if result.tokens_per_s_per_w is None else f"{result.tokens_per_s_per_w:.4f} tok/s/W"
             )
             print(f"  Result: {tokens_line} | {eff_line} | score {score:.4f}")
+            if result.tokens_per_s_per_w is not None:
+                print(f"    tokens/s/W: {result.tokens_per_s_per_w:.4f}")
 
             if best is None or result.score > best.score:
                 best = result
