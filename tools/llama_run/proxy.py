@@ -38,6 +38,26 @@ def _read_json_bytes(data: bytes) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _extract_tokens(payload: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """Extract (prompt_tokens, completion_tokens) from response payload."""
+    usage = payload.get("usage") or {}
+    prompt_tokens = usage.get("prompt_tokens") or payload.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens") or payload.get("completion_tokens")
+
+    # llama.cpp alternative fields
+    if prompt_tokens is None:
+        prompt_tokens = payload.get("prompt_eval_count") or payload.get("prompt_eval_tokens")
+    if completion_tokens is None:
+        completion_tokens = payload.get("eval_count") or payload.get("tokens_predicted")
+
+    if prompt_tokens is None or completion_tokens is None:
+        return None
+    try:
+        return (int(prompt_tokens), int(completion_tokens))
+    except Exception:
+        return None
+
+
 def _extract_total_tokens(payload: Dict[str, Any]) -> Optional[int]:
     usage = payload.get("usage") or {}
     prompt_tokens = usage.get("prompt_tokens") or payload.get("prompt_tokens")
@@ -63,15 +83,39 @@ def _extract_total_tokens(payload: Dict[str, Any]) -> Optional[int]:
 @dataclass
 class TokenMeter:
     total_tokens: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    last_prompt_tokens: int = 0
+    last_completion_tokens: int = 0
     lock: threading.Lock = threading.Lock()
 
-    def add(self, n: int) -> None:
+    def add(self, prompt_tokens: int, completion_tokens: int) -> None:
         with self.lock:
-            self.total_tokens += int(n)
+            self.prompt_tokens += int(prompt_tokens)
+            self.completion_tokens += int(completion_tokens)
+            self.total_tokens = self.prompt_tokens + self.completion_tokens
+            self.last_prompt_tokens = int(prompt_tokens)
+            self.last_completion_tokens = int(completion_tokens)
 
     def get(self) -> int:
         with self.lock:
             return int(self.total_tokens)
+
+    def get_prompt(self) -> int:
+        with self.lock:
+            return int(self.prompt_tokens)
+
+    def get_completion(self) -> int:
+        with self.lock:
+            return int(self.completion_tokens)
+
+    def get_last_prompt(self) -> int:
+        with self.lock:
+            return int(self.last_prompt_tokens)
+
+    def get_last_completion(self) -> int:
+        with self.lock:
+            return int(self.last_completion_tokens)
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -165,9 +209,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/v1/chat/completions") or self.path.startswith("/v1/completions"):
                 payload = _read_json_bytes(content)
                 if payload:
-                    total = _extract_total_tokens(payload)
-                    if total is not None and total >= 0:
-                        self.meter.add(total)
+                    tokens = _extract_tokens(payload)
+                    if tokens is not None:
+                        prompt_tokens, completion_tokens = tokens
+                        self.meter.add(prompt_tokens, completion_tokens)
 
         self.send_response(resp.status_code)
         for k, v in resp.headers.items():

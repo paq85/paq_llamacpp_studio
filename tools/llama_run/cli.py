@@ -177,6 +177,30 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 1
 
     model_alias = args.model_alias or utils.default_model_alias(model_path)
+    
+    # Calculate maximum context size based on available VRAM
+    max_context, ctx_msg = utils.calculate_max_context_size(
+        model_path=model_path,
+        cache_type_k=args.cache_type_k,
+        cache_type_v=args.cache_type_v,
+        reserve_vram_mb=utils.DEFAULT_VRAM_RESERVE_MB,
+    )
+    
+    if max_context is None:
+        print(f"Warning: Could not calculate max context size. {ctx_msg}", file=sys.stderr)
+        effective_ctx_size = args.ctx_size
+    else:
+        if max_context < args.ctx_size:
+            print(
+                f"Warning: Requested ctx-size ({args.ctx_size:,}) exceeds calculated max ({max_context:,}). "
+                f"Using {max_context:,}. {ctx_msg}",
+                file=sys.stderr,
+            )
+            effective_ctx_size = max_context
+        else:
+            effective_ctx_size = args.ctx_size
+            print(f"Info: {ctx_msg}")
+    
     cmd = [
         llama_server,
         "--model",
@@ -192,7 +216,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "--min-p",
         str(args.min_p),
         "--ctx-size",
-        str(args.ctx_size),
+        str(effective_ctx_size),
         "--batch-size",
         str(args.batch_size),
         "--ubatch-size",
@@ -311,10 +335,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 sampler=sampler,
                 perf=perf,
                 logs=logs,
+                max_context_size=effective_ctx_size,
+                last_prompt_tokens=0,
             )
-            run_tui(state, stop_cb=_stop, alive_cb=_alive)
+            run_tui(state, stop_cb=_stop, alive_cb=_alive, proxy=proxy)
         else:
             last_print = 0.0
+            last_prompt_tokens = 0
             while proc.poll() is None:
                 time.sleep(0.25)
                 now = time.time()
@@ -331,6 +358,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                     m15_p = perf.window(15.0 * 60.0)
                     all_p = perf.window(None)
 
+                    # Get last prompt tokens from proxy if available
+                    if proxy is not None:
+                        last_prompt_tokens = proxy.meter.get_last_prompt()
+
                     def fmt_tps(v):
                         return "n/a" if v is None else f"{v:.1f}"
 
@@ -340,8 +371,16 @@ def cmd_run(args: argparse.Namespace) -> int:
                             f"p_tok {w.prompt_tokens} g_tok {w.gen_tokens}"
                         )
 
+                    # Calculate context usage percentage
+                    if effective_ctx_size > 0:
+                        ctx_pct = (last_prompt_tokens / effective_ctx_size) * 100
+                        ctx_info = f"{last_prompt_tokens:,} / {effective_ctx_size:,} ({ctx_pct:.1f}%)"
+                    else:
+                        ctx_info = f"{last_prompt_tokens:,} / n/a"
+
                     sys.stdout.write(
                         f"[tok] totals: prompt {p_all} gen {g_all} total {p_all + g_all}\n"
+                        + f"[ctx] max: {effective_ctx_size:,} | last prompt: {ctx_info}\n"
                         + tok_line("now", now_p)
                         + "\n"
                         + tok_line("1m", m1_p)
@@ -390,6 +429,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     sys.stdout.write("---\n")
     sys.stdout.write(f"llama-server exited with code {rc}\n")
     sys.stdout.write("Stats summary:\n")
+    
+    # Get last prompt tokens from proxy if available
+    final_last_prompt = 0
+    if proxy is not None:
+        final_last_prompt = proxy.meter.get_last_prompt()
+    
+    # Calculate final context usage
+    if effective_ctx_size > 0:
+        final_ctx_pct = (final_last_prompt / effective_ctx_size) * 100
+        final_ctx_info = f"{final_last_prompt:,} / {effective_ctx_size:,} ({final_ctx_pct:.1f}%)"
+    else:
+        final_ctx_info = f"{final_last_prompt:,} / n/a"
+    
+    sys.stdout.write(f"[ctx] max context: {effective_ctx_size:,} | last prompt usage: {final_ctx_info}\n")
+    
     now_p = perf.last()
     m1_p = perf.window(60.0)
     m15_p = perf.window(15.0 * 60.0)

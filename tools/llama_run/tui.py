@@ -20,6 +20,8 @@ class TuiState:
     show_logs: bool = False
     paused: bool = False
     last_error: Optional[str] = None
+    max_context_size: int = 0
+    last_prompt_tokens: int = 0
 
 
 def _clamp(n: int, lo: int, hi: int) -> int:
@@ -119,6 +121,24 @@ def _fmt_wh(v: Optional[float]) -> str:
     return f"{wh:,.2f}Wh"
 
 
+def _fmt_ctx_usage(current: int, max_ctx: int) -> str:
+    """Format context usage as 'current/max (pct%)'."""
+    if max_ctx <= 0:
+        return f"{current:,} / n/a"
+    pct = (current / max_ctx) * 100
+    return f"{current:,} / {max_ctx:,} ({pct:.1f}%)"
+
+
+def _ctx_bar(current: int, max_ctx: int, width: int) -> str:
+    """Create a visual bar showing context usage."""
+    if width <= 0 or max_ctx <= 0:
+        return " " * width
+    pct = min(100.0, (current / max_ctx) * 100)
+    filled = int(round(pct / 100.0 * width))
+    filled = _clamp(filled, 0, width)
+    return "#" * filled + "-" * (width - filled)
+
+
 def _draw(stdscr, state: TuiState) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -153,10 +173,20 @@ def _draw(stdscr, state: TuiState) -> None:
         f"tokens processed: prompt {_fmt_tok(p_total)} | gen {_fmt_tok(g_total)} | total {_fmt_tok(p_total + g_total)}",
     )
 
+    # Context usage display
+    bar_w = max(10, min(40, w - 30))
+    ctx_bar = _ctx_bar(state.last_prompt_tokens, state.max_context_size, bar_w)
+    _safe_add(
+        stdscr,
+        3,
+        0,
+        f"context usage: [{ctx_bar}] {_fmt_ctx_usage(state.last_prompt_tokens, state.max_context_size)}",
+    )
+
     # Window table (performance)
     _safe_add(
         stdscr,
-        4,
+        5,
         0,
         "window   p_tok/s   g_tok/s   p_tok     g_tok     cpu     mem     rss        gpu    gcap     gpuW     vram",
         curses.A_UNDERLINE,
@@ -179,10 +209,10 @@ def _draw(stdscr, state: TuiState) -> None:
         )
         _safe_add(stdscr, y, 0, line)
 
-    row(5, "now", now_sum, perf_now)
-    row(6, "1m", m1, perf_1m)
-    row(7, "15m", m15, perf_15m)
-    row(8, "all", all_sum, perf_all)
+    row(6, "now", now_sum, perf_now)
+    row(7, "1m", m1, perf_1m)
+    row(8, "15m", m15, perf_15m)
+    row(9, "all", all_sum, perf_all)
 
     # Bars (now window, few seconds)
     bar_w = max(10, min(40, w - 20))
@@ -192,16 +222,16 @@ def _draw(stdscr, state: TuiState) -> None:
 
     gpu_cap_bar = _bar(now_sum.avg_gpu_power_percent_of_limit, bar_w)
 
-    _safe_add(stdscr, 10, 0, f"cpu  [{cpu_bar}] {_fmt_pct(now_sum.avg_cpu_percent)}")
-    _safe_add(stdscr, 11, 0, f"mem  [{mem_bar}] {_fmt_pct(now_sum.avg_mem_percent)}")
-    _safe_add(stdscr, 12, 0, f"gpu  [{gpu_bar}] {_fmt_pct(now_sum.avg_gpu_util)}")
-    _safe_add(stdscr, 13, 0, f"gcap [{gpu_cap_bar}] {_fmt_pct(now_sum.avg_gpu_power_percent_of_limit)}")
+    _safe_add(stdscr, 11, 0, f"cpu  [{cpu_bar}] {_fmt_pct(now_sum.avg_cpu_percent)}")
+    _safe_add(stdscr, 12, 0, f"mem  [{mem_bar}] {_fmt_pct(now_sum.avg_mem_percent)}")
+    _safe_add(stdscr, 13, 0, f"gpu  [{gpu_bar}] {_fmt_pct(now_sum.avg_gpu_util)}")
+    _safe_add(stdscr, 14, 0, f"gcap [{gpu_cap_bar}] {_fmt_pct(now_sum.avg_gpu_power_percent_of_limit)}")
 
     # Energy/power (window)
     pc_tag = "pc" if all_sum.pc_energy_source != "estimated" else "pc*"
     _safe_add(
         stdscr,
-        15,
+        16,
         0,
         f"energy (Wh) cpu/gpu/{pc_tag} | power (W) cpu/{pc_tag}",
         curses.A_UNDERLINE,
@@ -219,17 +249,17 @@ def _draw(stdscr, state: TuiState) -> None:
         # (pc label is indicated by * in the header and values; nothing else needed)
         _safe_add(stdscr, y, 0, line)
 
-    erow(16, "now", now_sum)
-    erow(17, "1m", m1)
-    erow(18, "15m", m15)
-    erow(19, "all", all_sum)
+    erow(17, "now", now_sum)
+    erow(18, "1m", m1)
+    erow(19, "15m", m15)
+    erow(20, "all", all_sum)
 
     if state.last_error:
-        _safe_add(stdscr, 21, 0, f"error: {state.last_error}"[: max(0, w - 1)], curses.A_BOLD)
+        _safe_add(stdscr, 22, 0, f"error: {state.last_error}"[: max(0, w - 1)], curses.A_BOLD)
 
     # Logs pane (tail)
     if state.show_logs:
-        start_y = 23
+        start_y = 24
         if start_y < h - 1:
             _safe_add(stdscr, start_y, 0, "logs (tail):", curses.A_UNDERLINE)
             max_lines = max(0, h - (start_y + 2))
@@ -240,10 +270,11 @@ def _draw(stdscr, state: TuiState) -> None:
     stdscr.refresh()
 
 
-def run_tui(state: TuiState, stop_cb, alive_cb) -> int:
+def run_tui(state: TuiState, stop_cb, alive_cb, proxy=None) -> int:
     """Blocking curses UI loop.
 
     stop_cb() is invoked when the user requests exit.
+    proxy is optional LlamaMeterProxy to read last prompt tokens.
     """
 
     def _main(stdscr) -> int:
@@ -272,6 +303,9 @@ def run_tui(state: TuiState, stop_cb, alive_cb) -> int:
                     state.paused = not state.paused
 
             if not state.paused:
+                # Update last prompt tokens from proxy if available
+                if proxy is not None:
+                    state.last_prompt_tokens = proxy.meter.get_last_prompt()
                 _draw(stdscr, state)
 
     return curses.wrapper(_main)

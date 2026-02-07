@@ -442,6 +442,29 @@ def cmd_server(args: argparse.Namespace) -> int:
 
     model_alias = args.model_alias or utils.default_model_alias(model_path)
 
+    # Calculate maximum context size based on available VRAM
+    max_context, ctx_msg = utils.calculate_max_context_size(
+        model_path=model_path,
+        cache_type_k=args.cache_type_k,
+        cache_type_v=args.cache_type_v,
+        reserve_vram_mb=utils.DEFAULT_VRAM_RESERVE_MB,
+    )
+    
+    if max_context is None:
+        print(f"Warning: Could not calculate max context size. {ctx_msg}", file=sys.stderr)
+        effective_ctx_size = args.ctx_size
+    else:
+        if max_context < args.ctx_size:
+            print(
+                f"Warning: Requested ctx-size ({args.ctx_size:,}) exceeds calculated max ({max_context:,}). "
+                f"Using {max_context:,}. {ctx_msg}",
+                file=sys.stderr,
+            )
+            effective_ctx_size = max_context
+        else:
+            effective_ctx_size = args.ctx_size
+            print(f"Info: {ctx_msg}")
+
     cmd = [
         llama_server,
         "--model",
@@ -459,7 +482,7 @@ def cmd_server(args: argparse.Namespace) -> int:
         "--min-p",
         str(args.min_p),
         "--ctx-size",
-        str(args.ctx_size),
+        str(effective_ctx_size),
         "--batch-size",
         str(args.batch_size),
         "--ubatch-size",

@@ -992,3 +992,144 @@ def human_duration(seconds: float) -> str:
     hours = minutes // 60
     minutes = minutes % 60
     return f"{hours}h{minutes}m"
+
+
+# Context size calculation constants
+DEFAULT_VRAM_RESERVE_MB = 500  # Minimum VRAM to keep free
+
+# Memory per token by KV cache quantization (bytes per token)
+# Based on typical model architectures and KV cache memory usage
+KV_CACHE_BYTES_PER_TOKEN = {
+    "f16": 4.0,     # float16
+    "f32": 8.0,     # float32
+    "q8_0": 1.0,    # 8-bit quantization
+    "q4_0": 0.5,    # 4-bit quantization
+    "q4_1": 0.5,    # 4-bit quantization
+    "q5_0": 0.625,  # 5-bit quantization
+    "q5_1": 0.625,  # 5-bit quantization
+    "q6_0": 0.75,   # 6-bit quantization
+    "default": 1.0, # default to 1 byte per token (q8_0)
+}
+
+
+def detect_quantization_from_model_path(model_path: Optional[str]) -> str:
+    """Detect quantization type from model filename."""
+    if not model_path:
+        return "q8_0"  # Default
+    
+    name_lower = Path(model_path).name.lower()
+    
+    if "q4_0" in name_lower or "q4_1" in name_lower:
+        return "q4_0"
+    elif "q5_0" in name_lower or "q5_1" in name_lower:
+        return "q5_0"
+    elif "q6_0" in name_lower or "q6_1" in name_lower:
+        return "q6_0"
+    elif "q8_0" in name_lower:
+        return "q8_0"
+    elif "f16" in name_lower or "fp16" in name_lower:
+        return "f16"
+    elif "f32" in name_lower or "fp32" in name_lower:
+        return "f32"
+    else:
+        # Default to q8_0 for Q4_K_XL, Q4_K_M, etc.
+        if "q4" in name_lower:
+            return "q8_0"  # Will be overridden by cache-type-k/v
+        elif "q5" in name_lower:
+            return "q8_0"
+        return "q8_0"
+
+
+def get_kv_cache_bytes_per_token(
+    cache_type_k: str = "q8_0",
+    cache_type_v: str = "q8_0"
+) -> float:
+    """Calculate bytes per token based on KV cache types."""
+    k_bytes = KV_CACHE_BYTES_PER_TOKEN.get(cache_type_k.lower(), 1.0)
+    v_bytes = KV_CACHE_BYTES_PER_TOKEN.get(cache_type_v.lower(), 1.0)
+    # Average of K and V
+    return (k_bytes + v_bytes) / 2.0
+
+
+def get_model_file_size_mb(model_path: Optional[str]) -> float:
+    """Get model file size in MB."""
+    if not model_path:
+        return 0.0
+    try:
+        size_bytes = Path(model_path).stat().st_size
+        return size_bytes / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def calculate_max_context_size(
+    model_path: Optional[str],
+    cache_type_k: str = "q8_0",
+    cache_type_v: str = "q8_0",
+    reserve_vram_mb: float = DEFAULT_VRAM_RESERVE_MB,
+) -> Tuple[Optional[int], str]:
+    """
+    Calculate maximum context size that can fit in available VRAM.
+    
+    Returns:
+        (max_context_tokens, message) where max_context_tokens is None if calculation failed
+    """
+    # Get GPU metrics
+    gpus = get_gpu_metrics()
+    if not gpus:
+        return None, "No GPU metrics available (nvidia-smi/rocm-smi not found)."
+    
+    # Find GPU with most free memory
+    max_free_mb = 0.0
+    gpu_info = ""
+    for gpu in gpus:
+        if gpu.mem_total_mb is None or gpu.mem_used_mb is None:
+            continue
+        free_mb = gpu.mem_total_mb - gpu.mem_used_mb
+        if free_mb > max_free_mb:
+            max_free_mb = free_mb
+            gpu_info = f"GPU {gpu.index} {gpu.name}: {free_mb:.0f}MB free / {gpu.mem_total_mb:.0f}MB total"
+    
+    if max_free_mb == 0:
+        return None, "GPU memory metrics unavailable."
+    
+    # Get model file size for base memory estimation
+    model_size_mb = get_model_file_size_mb(model_path)
+    
+    # Estimate context memory per token
+    # Typical formula: bytes_per_token * num_heads * head_dim * num_layers / num_heads
+    # For simplicity, we use empirical estimates based on KV cache type
+    kv_bytes_per_token = get_kv_cache_bytes_per_token(cache_type_k, cache_type_v)
+    
+    # For a typical 9B model with ~40 layers:
+    # KV cache uses approximately 2 * kv_bytes_per_token * num_layers * head_dim
+    # We use a scaling factor of ~100 to account for model architecture overhead
+    # This gives us roughly: 100 * kv_bytes_per_token per token
+    memory_per_token_mb = 100 * kv_bytes_per_token / 1024.0
+    
+    # Calculate available memory for KV cache
+    # We need: model_size + (context_size * memory_per_token) + reserve <= free_vram
+    # So: context_size <= (free_vram - model_size - reserve) / memory_per_token
+    available_for_context_mb = max_free_mb - model_size_mb - reserve_vram_mb
+    
+    if available_for_context_mb <= 0:
+        msg = f"Not enough VRAM. Free: {max_free_mb:.0f}MB, Model: {model_size_mb:.0f}MB, Reserve: {reserve_vram_mb:.0f}MB. {gpu_info}"
+        return 0, msg
+    
+    max_context = int(available_for_context_mb / memory_per_token_mb)
+    
+    # Apply safety factor (0.9) to account for overhead
+    max_context = int(max_context * 0.9)
+    
+    # Don't go below a reasonable minimum
+    if max_context < 2048:
+        msg = f"Calculated context ({max_context}) is very small. {gpu_info}"
+        return max(2048, max_context), msg
+    
+    msg = (
+        f"Calculated max context: {max_context:,} tokens. "
+        f"Free VRAM: {max_free_mb:.0f}MB, Model: {model_size_mb:.0f}MB, "
+        f"Reserve: {reserve_vram_mb:.0f}MB. {gpu_info}"
+    )
+    
+    return max_context, msg
