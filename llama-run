@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+VENV_PY="$ROOT_DIR/.venv/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+  PY="$VENV_PY"
+else
+  if command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+  elif command -v python >/dev/null 2>&1; then
+    PY="python"
+  else
+    echo "error: python not found (need python3)" >&2
+    exit 127
+  fi
+
+  cat >&2 <<'EOF'
+note: no local venv found at .venv/
+
+Recommended one-time setup:
+  python3 -m venv .venv
+  .venv/bin/python -m pip install -r tools/llama_bench/requirements.txt
+EOF
+fi
+
+if [[ $# -eq 0 ]]; then
+  set -- run
+elif [[ "${1:-}" == "run" || "${1:-}" == "stop-all" ]]; then
+  :
+elif [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  :
+elif [[ "${1:-}" == -* ]]; then
+  set -- run "$@"
+fi
+
+exec "$PY" -m tools.llama_run.cli "$@"
