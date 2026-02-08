@@ -783,6 +783,7 @@ paq_llamacpp_studio/
 ### Quick Start Guides
 - **[Getting Started](docs/QUICKSTART.md)** - One-command setup and first usage
 - **[GLM-4.7 Setup](docs/GLM-4.7_SETUP.md)** - Detailed configuration for GLM-4.7 Flash
+- **[OpenCode Integration](docs/OPCODE_INTEGRATION.md)** - Guide for using with OpenCode AI coding agent
 - **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues and solutions
 
 ### Advanced Documentation
