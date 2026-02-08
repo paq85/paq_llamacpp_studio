@@ -1,0 +1,55 @@
+---
+name: Bug Report
+about: Report a bug to help us improve LlamaCPP Studio
+title: '[BUG] '
+labels: bug
+assignees: ''
+---
+
+**Is this feature request related to a problem? Please describe.**
+
+A clear and concise description of what the bug is.
+
+**Describe the environment**
+- OS: [e.g., Ubuntu 22.04, Windows 10, macOS 12]
+- Python Version: [e.g., 3.9.7]
+- GPU: [e.g., NVIDIA RTX 3080 10GB, AMD RX 6800 XT]
+- RAM: [e.g., 32GB DDR4]
+- VRAM: [e.g., 10GB]
+
+**Expected behavior**
+
+What should happen when you do what you're trying to do?
+
+**Actual behavior**
+
+What actually happens instead?
+
+**Steps to reproduce**
+
+1. Step 1
+2. Step 2
+3. Step 3
+
+**Error messages/logs**
+
+If applicable, paste error messages or log outputs here:
+
+```
+Paste error messages or logs here
+```
+
+**Screenshots**
+
+If applicable, add screenshots to help explain your problem.
+
+**Additional context**
+
+Add any other context about the problem here. Include:
+- Command line arguments used
+- Configuration settings applied
+- Any relevant command outputs
+
+**Suggested solution (optional)**
+
+If you have an idea about how the bug can be fixed, please describe it here.

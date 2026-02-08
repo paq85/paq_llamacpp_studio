@@ -2,16 +2,49 @@ import argparse
 from collections import deque
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from typing import Optional
 
 from tools.llama_bench import utils
 from tools.llama_run.tui import TuiState, run_tui
 from tools.llama_run.proxy import LlamaMeterProxy
 from tools.llama_run.logperf import LogPerfMeter
+
+# Minimum context size - model will never be loaded with less than this
+MIN_CONTEXT_SIZE = 4096
+
+
+def _wait_for_server(host: str, port: int, timeout_s: float = 60.0) -> bool:
+    """Wait for server to be ready by polling the port."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def _wait_for_models_ready(host: str, port: int, timeout_s: float = 180.0) -> bool:
+    """Wait until llama-server reports a loaded model via /v1/models."""
+    deadline = time.time() + timeout_s
+    url = f"http://{host}:{port}/v1/models"
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.25)
+    return False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,7 +64,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--port", type=int, default=11433, help="Server port")
 
     # common knobs (kept in sync with tools/llama_bench)
-    run.add_argument("--ctx-size", type=int, default=200000, help="Context size")
+    run.add_argument(
+        "--ctx-size",
+        type=int,
+        default=None,
+        help="Maximum context size cap. If omitted, default is the model's GGUF context_length.",
+    )
+    run.add_argument(
+        "--max-model-ctx",
+        type=int,
+        default=None,
+        help="Maximum context size the model supports. If omitted, try to read it from GGUF metadata; otherwise fall back to 128000.",
+    )
     run.add_argument("--batch-size", type=int, default=4096, help="Batch size")
     run.add_argument("--ubatch-size", type=int, default=1024, help="Micro-batch size")
     run.add_argument("--cache-type-k", default="q8_0", help="KV cache type for K")
@@ -68,6 +112,25 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--stats-interval", type=float, default=10.0, help="How often to print stats in plain mode")
     run.add_argument("--metrics-url", help="Prometheus metrics endpoint (default: http://HOST:PORT/metrics)")
     run.add_argument("--no-gpu", action="store_true", help="Disable GPU sampling")
+    run.add_argument("--test-timeout", type=float, default=0, help="Auto-stop after N seconds (for testing)")
+    run.add_argument(
+        "--auto-optimize-context",
+        action="store_true",
+        default=True,
+        help="After model loads, increase context (up to requested/model max) if there's VRAM headroom (default: on)",
+    )
+    run.add_argument(
+        "--no-auto-optimize-context",
+        action="store_false",
+        dest="auto_optimize_context",
+        help="Disable post-load context optimization",
+    )
+    run.add_argument(
+        "--optimize-context-threshold-mb",
+        type=float,
+        default=2048.0,
+        help="Minimum 'wasted' VRAM (above reserve) before optimizing context size (default: 2048 MB)",
+    )
 
     run.add_argument(
         "extra_args",
@@ -132,75 +195,64 @@ def _format_window(label: str, summary: utils.SampleSummary) -> str:
     )
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    llama_cpp_dir = args.llama_cpp_dir or os.environ.get("LLAMA_CPP_DIR")
-    llama_server = args.llama_server or utils.find_llama_server(llama_cpp_dir)
-    if not llama_server:
-        print(
-            "llama-server not found. Provide --llama-server or --llama-cpp-dir, or ensure llama-server is on PATH.",
-            file=sys.stderr,
+def get_system_info() -> str:
+    """Get CPU and GPU information for display."""
+    cpu_name, cpu_count = utils.get_cpu_info()
+    
+    gpus = utils.get_gpu_metrics()
+    gpu_info = []
+    if gpus:
+        for gpu in gpus:
+            if gpu.mem_total_mb:
+                gpu_str = f"{gpu.name} ({gpu.mem_total_mb/1024.0:.1f}GB)"
+            else:
+                gpu_str = gpu.name
+            gpu_info.append(gpu_str)
+    
+    if gpu_info:
+        gpu_str = "| ".join(gpu_info)
+    else:
+        gpu_str = "n/a"
+
+    # Get system memory info
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["free", "-g"],
+            capture_output=True,
+            text=True,
+            timeout=2.0
         )
-        return 1
-
-    model_path = utils.find_model_path(
-        args.model,
-        args.model_dir,
-        preferred_files=utils.DEFAULT_MODEL_FILES,
-        preferred_substrings=utils.DEFAULT_MODEL_SUBSTRINGS,
-    )
-    if not model_path:
-        candidates = utils.list_models(args.model_dir)
-        if not candidates:
-            print(
-                "Model not found. Provide --model or set MODEL env var, or place a .gguf in ~/models.",
-                file=sys.stderr,
-            )
+        if result.returncode == 0:
+            lines = result.stdout.split('\n')
+            for line in lines:
+                if line.startswith('Mem:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        mem_total = parts[1]
+                        mem_str = f"{mem_total}GB"
+                    else:
+                        mem_str = "n/a"
+                    break
+            else:
+                mem_str = "n/a"
         else:
-            print("Multiple models found. Choose one with --model:", file=sys.stderr)
-            for item in candidates:
-                print(f"  {item}", file=sys.stderr)
-        return 1
+            mem_str = "n/a"
+    except Exception:
+        mem_str = "n/a"
 
-    proxy: Optional[LlamaMeterProxy] = None
-    backend_port = args.port
-    if args.proxy == "on":
-        # Reserve the public port for our proxy and run the actual llama-server on a free port.
-        ok, reason = utils.check_port_available(args.port)
-        if not ok:
-            print(reason, file=sys.stderr)
-            return 1
-        backend_port = utils.find_free_port()
-    else:
-        ok, reason = utils.check_port_available(args.port)
-        if not ok:
-            print(reason, file=sys.stderr)
-            return 1
+    return f"CPU: {cpu_name} ({cpu_count} cores) | RAM: {mem_str} | GPU: {gpu_str}"
 
-    model_alias = args.model_alias or utils.default_model_alias(model_path)
-    
-    # Calculate maximum context size based on available VRAM
-    max_context, ctx_msg = utils.calculate_max_context_size(
-        model_path=model_path,
-        cache_type_k=args.cache_type_k,
-        cache_type_v=args.cache_type_v,
-        reserve_vram_mb=utils.DEFAULT_VRAM_RESERVE_MB,
-    )
-    
-    if max_context is None:
-        print(f"Warning: Could not calculate max context size. {ctx_msg}", file=sys.stderr)
-        effective_ctx_size = args.ctx_size
-    else:
-        if max_context < args.ctx_size:
-            print(
-                f"Warning: Requested ctx-size ({args.ctx_size:,}) exceeds calculated max ({max_context:,}). "
-                f"Using {max_context:,}. {ctx_msg}",
-                file=sys.stderr,
-            )
-            effective_ctx_size = max_context
-        else:
-            effective_ctx_size = args.ctx_size
-            print(f"Info: {ctx_msg}")
-    
+
+def _build_server_cmd(
+    llama_server: str,
+    model_path: str,
+    backend_port: int,
+    ctx_size: int,
+    args: argparse.Namespace,
+    model_alias: Optional[str] = None,
+) -> list:
+    """Build the llama-server command with given context size."""
     cmd = [
         llama_server,
         "--model",
@@ -216,7 +268,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "--min-p",
         str(args.min_p),
         "--ctx-size",
-        str(effective_ctx_size),
+        str(ctx_size),
         "--batch-size",
         str(args.batch_size),
         "--ubatch-size",
@@ -246,7 +298,143 @@ def cmd_run(args: argparse.Namespace) -> int:
     if extra_args and extra_args[0] == "--":
         extra_args = extra_args[1:]
     cmd.extend(extra_args)
+    return cmd
 
+
+def cmd_run(args: argparse.Namespace) -> int:
+    llama_cpp_dir = args.llama_cpp_dir or os.environ.get("LLAMA_CPP_DIR")
+    llama_server = args.llama_server or utils.find_llama_server(llama_cpp_dir)
+    if not llama_server:
+        print(
+            "llama-server not found. Provide --llama-server or --llama-cpp-dir, or ensure llama-server is on PATH.",
+            file=sys.stderr,
+        )
+        return 1
+
+    model_path = utils.find_model_path(
+        args.model,
+        args.model_dir,
+        preferred_files=utils.DEFAULT_MODEL_FILES,
+        preferred_substrings=utils.DEFAULT_MODEL_SUBSTRINGS,
+    )
+    if not model_path:
+        candidates = utils.list_models(args.model_dir)
+        if not candidates:
+            print(
+                "Model not found. Provide --model or set MODEL env var, or place a .gguf in ~/models.",
+                file=sys.stderr,
+            )
+        else:
+            print("Multiple models found. Choose one with --model:", file=sys.stderr)
+            for item in candidates:
+                print(f"  {item}", file=sys.stderr)
+        return 1
+
+    # Determine model context limit (never set ctx-size above this).
+    detected_model_ctx = utils.get_gguf_context_length(model_path)
+    if detected_model_ctx:
+        if args.max_model_ctx is None:
+            args.max_model_ctx = int(detected_model_ctx)
+            print(f"Info: Model GGUF metadata reports context_length={args.max_model_ctx:,}")
+        else:
+            if int(args.max_model_ctx) > int(detected_model_ctx):
+                print(
+                    f"Warning: --max-model-ctx ({args.max_model_ctx:,}) exceeds GGUF context_length "
+                    f"({int(detected_model_ctx):,}). Capping to {int(detected_model_ctx):,}.",
+                    file=sys.stderr,
+                )
+                args.max_model_ctx = int(detected_model_ctx)
+    else:
+        if args.max_model_ctx is None:
+            args.max_model_ctx = 128000
+            print(
+                "Warning: Could not read model context_length from GGUF metadata; "
+                "using conservative default --max-model-ctx 128000. Override with --max-model-ctx if needed.",
+                file=sys.stderr,
+            )
+
+    proxy: Optional[LlamaMeterProxy] = None
+    backend_port = args.port
+    if args.proxy == "on":
+        # Reserve the public port for our proxy and run the actual llama-server on a free port.
+        ok, reason = utils.check_port_available(args.port)
+        if not ok:
+            print(reason, file=sys.stderr)
+            return 1
+        backend_port = utils.find_free_port()
+    else:
+        ok, reason = utils.check_port_available(args.port)
+        if not ok:
+            print(reason, file=sys.stderr)
+            return 1
+
+    model_alias = args.model_alias or utils.default_model_alias(model_path)
+    
+    # Determine the desired context cap:
+    # - default: model max context_length
+    # - if user specifies --ctx-size: treat it as a cap
+    user_ctx_cap = args.ctx_size if args.ctx_size is not None else int(args.max_model_ctx)
+    desired_ctx_cap = int(min(int(user_ctx_cap), int(args.max_model_ctx)))
+    if desired_ctx_cap < MIN_CONTEXT_SIZE:
+        print(
+            f"Notice: Requested/capped ctx-size ({desired_ctx_cap:,}) is below minimum ({MIN_CONTEXT_SIZE:,}). "
+            f"Using {MIN_CONTEXT_SIZE:,} instead.",
+            file=sys.stderr,
+        )
+        desired_ctx_cap = MIN_CONTEXT_SIZE
+
+    # Calculate a conservative pre-load context size based on available VRAM.
+    # This is used as a safe starting point; we may increase it after the model is loaded.
+    max_context, ctx_msg = utils.calculate_max_context_size(
+        model_path=model_path,
+        cache_type_k=args.cache_type_k,
+        cache_type_v=args.cache_type_v,
+        reserve_vram_mb=utils.DEFAULT_VRAM_RESERVE_MB,
+    )
+    if max_context is None:
+        print(f"Warning: Could not estimate VRAM-based max context. {ctx_msg}", file=sys.stderr)
+        effective_ctx_size = desired_ctx_cap
+    else:
+        # Start at the conservative estimate, but never exceed desired cap.
+        if int(max_context) < int(desired_ctx_cap):
+            print(
+                f"Warning: Desired ctx-size ({desired_ctx_cap:,}) exceeds conservative VRAM estimate ({int(max_context):,}). "
+                f"Starting at {int(max_context):,} and will try to raise after model load. {ctx_msg}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Info: {ctx_msg}")
+        effective_ctx_size = int(min(int(max_context), int(desired_ctx_cap)))
+    
+    # Ensure minimum context size (again, after VRAM estimation)
+    if effective_ctx_size < MIN_CONTEXT_SIZE:
+        print(
+            f"Notice: Context size ({effective_ctx_size:,}) is below minimum ({MIN_CONTEXT_SIZE:,}). "
+            f"Using {MIN_CONTEXT_SIZE:,} instead.",
+            file=sys.stderr,
+        )
+        effective_ctx_size = MIN_CONTEXT_SIZE
+
+    # Enforce maximum model context size - NEVER exceed what the model supports
+    if effective_ctx_size > int(args.max_model_ctx):
+        print(
+            f"Warning: Selected context ({effective_ctx_size:,}) exceeds model's maximum "
+            f"({int(args.max_model_ctx):,}). Using {int(args.max_model_ctx):,} instead.",
+            file=sys.stderr,
+        )
+        effective_ctx_size = int(args.max_model_ctx)
+    
+    # Build command and start server
+    cmd = _build_server_cmd(
+        llama_server=llama_server,
+        model_path=model_path,
+        backend_port=backend_port,
+        ctx_size=effective_ctx_size,
+        args=args,
+        model_alias=model_alias,
+    )
+
+    print(get_system_info())
     print("Launching llama-server:")
     print(" ".join(cmd))
     print("---")
@@ -258,6 +446,117 @@ def cmd_run(args: argparse.Namespace) -> int:
         text=True,
         bufsize=1,
     )
+
+    # Wait for model load and check if we can optimize context.
+    # IMPORTANT: The TCP port can open before the model is loaded; /v1/models is the readiness signal.
+    server_host = "127.0.0.1" if args.proxy == "on" else args.host
+    desired_ctx = int(desired_ctx_cap)
+
+    if _wait_for_models_ready(server_host, backend_port, timeout_s=180.0):
+        free_mb, free_msg = utils.get_max_free_vram_mb()
+        if free_mb is None:
+            # Can't make a VRAM-based decision, but we can still keep the initial ctx.
+            pass
+        else:
+            # If we started below the desired cap and have headroom, try to increase context.
+            # Primary strategy: try the desired cap directly (model max by default). If it fails
+            # to become ready, fall back to the previous working context.
+            headroom_mb = float(free_mb) - float(utils.DEFAULT_VRAM_RESERVE_MB)
+            # If we started below the desired context cap, try the cap directly.
+            # This is the behavior you want for "use model max ctx unless it OOMs".
+            if args.auto_optimize_context and effective_ctx_size < desired_ctx:
+                candidate_ctx = int(desired_ctx)
+                if candidate_ctx > int(args.max_model_ctx):
+                    candidate_ctx = int(args.max_model_ctx)
+
+                print(
+                    f"\n[context-optimize] post-load VRAM: {free_mb:.0f}MB free (headroom {headroom_mb:.0f}MB). "
+                    f"Trying ctx-size {effective_ctx_size:,} -> {candidate_ctx:,} (cap {desired_ctx:,}, model max {int(args.max_model_ctx):,}). {free_msg}"
+                )
+                print(f"[context-optimize] Restarting server with higher context size: {candidate_ctx:,}")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                
+                # Rebuild command with optimized context
+                cmd = _build_server_cmd(
+                    llama_server=llama_server,
+                    model_path=model_path,
+                    backend_port=backend_port,
+                    ctx_size=candidate_ctx,
+                    args=args,
+                    model_alias=model_alias,
+                )
+                
+                print("\nRelaunching llama-server with optimized context:")
+                print(" ".join(cmd))
+                print("---")
+                
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+
+                effective_ctx_size = candidate_ctx
+
+                # Wait again for the restarted server to finish loading.
+                if not _wait_for_models_ready(server_host, backend_port, timeout_s=180.0):
+                    print(
+                        f"Warning: Server did not become ready after trying ctx-size {candidate_ctx:,}; "
+                        f"falling back to {int(effective_ctx_size):,}.",
+                        file=sys.stderr,
+                    )
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=10)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+
+                    # Fall back to the previous (conservative) context.
+                    fallback_ctx = int(min(int(max_context or effective_ctx_size), int(desired_ctx)))
+                    if fallback_ctx < MIN_CONTEXT_SIZE:
+                        fallback_ctx = MIN_CONTEXT_SIZE
+                    cmd = _build_server_cmd(
+                        llama_server=llama_server,
+                        model_path=model_path,
+                        backend_port=backend_port,
+                        ctx_size=fallback_ctx,
+                        args=args,
+                        model_alias=model_alias,
+                    )
+                    print("\nRelaunching llama-server with fallback context:")
+                    print(" ".join(cmd))
+                    print("---")
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                    )
+                    effective_ctx_size = fallback_ctx
+                    if not _wait_for_models_ready(server_host, backend_port, timeout_s=180.0):
+                        print("Error: Server failed to become ready after fallback", file=sys.stderr)
+                        return 1
+    else:
+        print("Warning: Server did not become ready (/v1/models) within timeout; skipping context optimization", file=sys.stderr)
+
+    # Always print a single final context decision line.
+    cons_str = "n/a" if max_context is None else f"{int(max_context):,}"
+    sys.stdout.write(
+        f"[ctx] selected: {effective_ctx_size:,} | cap: {int(desired_ctx_cap):,} | "
+        f"model_max: {int(args.max_model_ctx):,} | conservative_est: {cons_str}\n"
+    )
+    sys.stdout.flush()
 
     logs = deque(maxlen=500)
     perf = LogPerfMeter(retention_s=16 * 60.0)
@@ -311,17 +610,33 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("note: no TTY detected; falling back to --ui plain", file=sys.stderr)
         want_tui = False
 
+    # Setup timeout if specified
+    test_deadline = None
+    if args.test_timeout > 0:
+        test_deadline = time.time() + args.test_timeout
+        print(f"[test] Auto-stop in {args.test_timeout}s")
+
+    def _stop() -> None:
+        try:
+            if proxy:
+                proxy.stop()
+            proc.send_signal(signal.SIGINT)
+        except Exception:
+            pass
+
+    # Start timeout timer if specified
+    timeout_timer = None
+    if test_deadline:
+        def _timeout_handler():
+            time.sleep(args.test_timeout)
+            print("\n[test] Timeout reached, stopping server...")
+            _stop()
+        timeout_timer = threading.Thread(target=_timeout_handler, daemon=True)
+        timeout_timer.start()
+
     try:
         if want_tui:
             endpoint = f"http://{args.host}:{args.port}"
-
-            def _stop() -> None:
-                try:
-                    if proxy:
-                        proxy.stop()
-                    proc.send_signal(signal.SIGINT)
-                except Exception:
-                    pass
 
             def _alive() -> bool:
                 return proc.poll() is None
@@ -336,12 +651,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 perf=perf,
                 logs=logs,
                 max_context_size=effective_ctx_size,
-                last_prompt_tokens=0,
+                last_ctx_tokens=0,
+                system_info=get_system_info(),
             )
             run_tui(state, stop_cb=_stop, alive_cb=_alive, proxy=proxy)
         else:
             last_print = 0.0
-            last_prompt_tokens = 0
+            last_ctx_tokens = 0
             while proc.poll() is None:
                 time.sleep(0.25)
                 now = time.time()
@@ -358,9 +674,16 @@ def cmd_run(args: argparse.Namespace) -> int:
                     m15_p = perf.window(15.0 * 60.0)
                     all_p = perf.window(None)
 
-                    # Get last prompt tokens from proxy if available
+                    # Context usage (tokens used by the most recent request).
+                    # Prefer proxy metering; fall back to llama-server log parsing.
+                    last_ctx_tokens = 0
                     if proxy is not None:
-                        last_prompt_tokens = proxy.meter.get_last_prompt()
+                        try:
+                            last_ctx_tokens = int(proxy.meter.get_current_context())
+                        except Exception:
+                            last_ctx_tokens = 0
+                    if last_ctx_tokens <= 0:
+                        last_ctx_tokens = int(now_p.total_tokens)
 
                     def fmt_tps(v):
                         return "n/a" if v is None else f"{v:.1f}"
@@ -373,14 +696,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
                     # Calculate context usage percentage
                     if effective_ctx_size > 0:
-                        ctx_pct = (last_prompt_tokens / effective_ctx_size) * 100
-                        ctx_info = f"{last_prompt_tokens:,} / {effective_ctx_size:,} ({ctx_pct:.1f}%)"
+                        ctx_pct = (last_ctx_tokens / effective_ctx_size) * 100
+                        ctx_info = f"{last_ctx_tokens:,} / {effective_ctx_size:,} ({ctx_pct:.1f}%)"
                     else:
-                        ctx_info = f"{last_prompt_tokens:,} / n/a"
+                        ctx_info = f"{last_ctx_tokens:,} / n/a"
 
                     sys.stdout.write(
                         f"[tok] totals: prompt {p_all} gen {g_all} total {p_all + g_all}\n"
-                        + f"[ctx] max: {effective_ctx_size:,} | last prompt: {ctx_info}\n"
+                        + f"[ctx] max: {effective_ctx_size:,} | last request: {ctx_info}\n"
                         + tok_line("now", now_p)
                         + "\n"
                         + tok_line("1m", m1_p)
@@ -388,6 +711,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                         + tok_line("15m", m15_p)
                         + "\n"
                         + tok_line("all", all_p)
+                        + "\n"
+                        + get_system_info()
                         + "\n"
                         + "[sys] "
                         + _format_window("now", now_sum)
@@ -402,6 +727,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         + _format_window("all", all_sum)
                         + "\n"
                     )
+                    sys.stdout.flush()
                     sys.stdout.flush()
     except KeyboardInterrupt:
         sys.stdout.write("\nStopping server...\n")
@@ -428,21 +754,32 @@ def cmd_run(args: argparse.Namespace) -> int:
     rc = proc.wait()
     sys.stdout.write("---\n")
     sys.stdout.write(f"llama-server exited with code {rc}\n")
+    sys.stdout.write(get_system_info())
+    sys.stdout.write("\n")
     sys.stdout.write("Stats summary:\n")
     
-    # Get last prompt tokens from proxy if available
-    final_last_prompt = 0
+    # Context usage (tokens used by the most recent request).
+    # Prefer proxy metering; fall back to the last log-perf sample.
+    final_last_ctx = 0
     if proxy is not None:
-        final_last_prompt = proxy.meter.get_last_prompt()
-    
+        try:
+            final_last_ctx = int(proxy.meter.get_current_context())
+        except Exception:
+            final_last_ctx = 0
+    if final_last_ctx <= 0:
+        try:
+            final_last_ctx = int(perf.last().total_tokens)
+        except Exception:
+            final_last_ctx = 0
+
     # Calculate final context usage
     if effective_ctx_size > 0:
-        final_ctx_pct = (final_last_prompt / effective_ctx_size) * 100
-        final_ctx_info = f"{final_last_prompt:,} / {effective_ctx_size:,} ({final_ctx_pct:.1f}%)"
+        final_ctx_pct = (final_last_ctx / effective_ctx_size) * 100
+        final_ctx_info = f"{final_last_ctx:,} / {effective_ctx_size:,} ({final_ctx_pct:.1f}%)"
     else:
-        final_ctx_info = f"{final_last_prompt:,} / n/a"
-    
-    sys.stdout.write(f"[ctx] max context: {effective_ctx_size:,} | last prompt usage: {final_ctx_info}\n")
+        final_ctx_info = f"{final_last_ctx:,} / n/a"
+
+    sys.stdout.write(f"[ctx] max context: {effective_ctx_size:,} | last request usage: {final_ctx_info}\n")
     
     now_p = perf.last()
     m1_p = perf.window(60.0)

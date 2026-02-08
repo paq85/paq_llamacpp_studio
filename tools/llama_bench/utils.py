@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -38,6 +39,9 @@ DEFAULT_MODEL_FILES = [
 DEFAULT_MODEL_SUBSTRINGS = [
     "glm-4.7-flash",
 ]
+
+# VRAM management constants
+DEFAULT_VRAM_RESERVE_MB = 500  # Minimum VRAM to keep free for other processes
 
 
 def require(module: Any, name: str) -> None:
@@ -166,6 +170,297 @@ def default_model_alias(model_path: Optional[str]) -> Optional[str]:
     return Path(model_path).stem
 
 
+def get_gguf_context_length(model_path: Optional[str]) -> Optional[int]:
+    """Best-effort: read model's supported context length from GGUF metadata.
+
+    This is used to avoid setting --ctx-size above what the model supports.
+    Returns None if the file isn't GGUF or parsing fails.
+    """
+    if not model_path:
+        return None
+    try:
+        p = Path(model_path)
+        if p.suffix.lower() != ".gguf" or not p.is_file():
+            return None
+    except Exception:
+        return None
+
+    # GGUF v2/v3 key used by llama.cpp is typically "llama.context_length".
+    prefer_keys = [
+        "llama.context_length",
+        "general.context_length",
+        "context_length",
+        "llama.n_ctx_train",
+        "n_ctx_train",
+    ]
+    for key in prefer_keys:
+        v = _read_gguf_kv_int(model_path, key)
+        if isinstance(v, int) and v > 0:
+            return v
+    # Fallback: some models store this under an architecture-specific prefix,
+    # e.g. "deepseek2.context_length".
+    return _scan_gguf_any_context_length(model_path)
+
+
+def _scan_gguf_any_context_length(model_path: str) -> Optional[int]:
+    """Scan GGUF KVs and return the largest *.*context_length integer value."""
+    GGUF_TYPE_UINT32 = 4
+    GGUF_TYPE_INT32 = 5
+    GGUF_TYPE_STRING = 8
+    GGUF_TYPE_ARRAY = 9
+    GGUF_TYPE_UINT64 = 10
+    GGUF_TYPE_INT64 = 11
+
+    def read_u32(f) -> int:
+        b = f.read(4)
+        if len(b) != 4:
+            raise EOFError
+        return struct.unpack("<I", b)[0]
+
+    def read_u64(f) -> int:
+        b = f.read(8)
+        if len(b) != 8:
+            raise EOFError
+        return struct.unpack("<Q", b)[0]
+
+    def read_i32(f) -> int:
+        b = f.read(4)
+        if len(b) != 4:
+            raise EOFError
+        return struct.unpack("<i", b)[0]
+
+    def read_i64(f) -> int:
+        b = f.read(8)
+        if len(b) != 8:
+            raise EOFError
+        return struct.unpack("<q", b)[0]
+
+    def skip_n(f, n: int) -> None:
+        if n <= 0:
+            return
+        f.seek(n, 1)
+
+    def skip_value(f, vtype: int) -> None:
+        # Common fixed-size types
+        fixed_sizes = {
+            0: 1,  # u8
+            1: 1,  # i8
+            2: 2,  # u16
+            3: 2,  # i16
+            4: 4,  # u32
+            5: 4,  # i32
+            6: 4,  # f32
+            7: 1,  # bool
+            10: 8,  # u64
+            11: 8,  # i64
+            12: 8,  # f64
+        }
+        if vtype in fixed_sizes:
+            skip_n(f, fixed_sizes[vtype])
+            return
+        if vtype == GGUF_TYPE_STRING:
+            slen = read_u64(f)
+            skip_n(f, int(slen))
+            return
+        if vtype == GGUF_TYPE_ARRAY:
+            elem_type = read_u32(f)
+            n = read_u64(f)
+            if elem_type == GGUF_TYPE_STRING:
+                for _ in range(int(n)):
+                    slen = read_u64(f)
+                    skip_n(f, int(slen))
+                return
+            elem_sizes = {
+                0: 1,
+                1: 1,
+                2: 2,
+                3: 2,
+                4: 4,
+                5: 4,
+                6: 4,
+                7: 1,
+                10: 8,
+                11: 8,
+                12: 8,
+            }
+            esz = elem_sizes.get(int(elem_type))
+            if esz is None:
+                raise ValueError("unsupported GGUF array element type")
+            skip_n(f, int(n) * int(esz))
+            return
+        raise ValueError("unsupported GGUF value type")
+
+    best: Optional[int] = None
+    try:
+        with open(model_path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            _version = read_u32(f)
+            _n_tensors = read_u64(f)
+            n_kv = read_u64(f)
+            for _i in range(int(n_kv)):
+                klen = read_u64(f)
+                key = f.read(int(klen)).decode("utf-8", errors="replace")
+                vtype = read_u32(f)
+                is_ctx = "context_length" in key.lower()
+                if is_ctx and vtype in (GGUF_TYPE_UINT32, GGUF_TYPE_INT32, GGUF_TYPE_UINT64, GGUF_TYPE_INT64):
+                    if vtype == GGUF_TYPE_UINT32:
+                        v = int(read_u32(f))
+                    elif vtype == GGUF_TYPE_INT32:
+                        v = int(read_i32(f))
+                    elif vtype == GGUF_TYPE_UINT64:
+                        v = int(read_u64(f))
+                    else:
+                        v = int(read_i64(f))
+                    if v > 0:
+                        best = v if best is None else max(best, v)
+                else:
+                    skip_value(f, int(vtype))
+    except Exception:
+        return None
+    return best
+
+
+def _read_gguf_kv_int(model_path: str, want_key: str) -> Optional[int]:
+    """Read a single integer KV entry from a GGUF file (best-effort)."""
+
+    # GGUF value type IDs (little-endian). We only need the integer ones.
+    GGUF_TYPE_UINT8 = 0
+    GGUF_TYPE_INT8 = 1
+    GGUF_TYPE_UINT16 = 2
+    GGUF_TYPE_INT16 = 3
+    GGUF_TYPE_UINT32 = 4
+    GGUF_TYPE_INT32 = 5
+    GGUF_TYPE_FLOAT32 = 6
+    GGUF_TYPE_BOOL = 7
+    GGUF_TYPE_STRING = 8
+    GGUF_TYPE_ARRAY = 9
+    GGUF_TYPE_UINT64 = 10
+    GGUF_TYPE_INT64 = 11
+    GGUF_TYPE_FLOAT64 = 12
+
+    def read_u32(f) -> int:
+        b = f.read(4)
+        if len(b) != 4:
+            raise EOFError
+        return struct.unpack("<I", b)[0]
+
+    def read_u64(f) -> int:
+        b = f.read(8)
+        if len(b) != 8:
+            raise EOFError
+        return struct.unpack("<Q", b)[0]
+
+    def read_i32(f) -> int:
+        b = f.read(4)
+        if len(b) != 4:
+            raise EOFError
+        return struct.unpack("<i", b)[0]
+
+    def read_i64(f) -> int:
+        b = f.read(8)
+        if len(b) != 8:
+            raise EOFError
+        return struct.unpack("<q", b)[0]
+
+    def skip_n(f, n: int) -> None:
+        if n <= 0:
+            return
+        # Read/discard to avoid large memory usage.
+        chunk = 1024 * 1024
+        remaining = n
+        while remaining > 0:
+            take = chunk if remaining > chunk else remaining
+            data = f.read(take)
+            if len(data) != take:
+                raise EOFError
+            remaining -= take
+
+    def skip_value(f, vtype: int) -> None:
+        if vtype in (GGUF_TYPE_UINT8, GGUF_TYPE_INT8, GGUF_TYPE_BOOL):
+            skip_n(f, 1)
+            return
+        if vtype in (GGUF_TYPE_UINT16, GGUF_TYPE_INT16):
+            skip_n(f, 2)
+            return
+        if vtype in (GGUF_TYPE_UINT32, GGUF_TYPE_INT32, GGUF_TYPE_FLOAT32):
+            skip_n(f, 4)
+            return
+        if vtype in (GGUF_TYPE_UINT64, GGUF_TYPE_INT64, GGUF_TYPE_FLOAT64):
+            skip_n(f, 8)
+            return
+        if vtype == GGUF_TYPE_STRING:
+            n = read_u64(f)
+            skip_n(f, int(n))
+            return
+        if vtype == GGUF_TYPE_ARRAY:
+            elem_type = read_u32(f)
+            n = read_u64(f)
+            # Skip array elements.
+            if elem_type == GGUF_TYPE_STRING:
+                for _ in range(int(n)):
+                    slen = read_u64(f)
+                    skip_n(f, int(slen))
+            else:
+                sizes = {
+                    GGUF_TYPE_UINT8: 1,
+                    GGUF_TYPE_INT8: 1,
+                    GGUF_TYPE_BOOL: 1,
+                    GGUF_TYPE_UINT16: 2,
+                    GGUF_TYPE_INT16: 2,
+                    GGUF_TYPE_UINT32: 4,
+                    GGUF_TYPE_INT32: 4,
+                    GGUF_TYPE_FLOAT32: 4,
+                    GGUF_TYPE_UINT64: 8,
+                    GGUF_TYPE_INT64: 8,
+                    GGUF_TYPE_FLOAT64: 8,
+                }
+                sz = sizes.get(int(elem_type))
+                if sz is None:
+                    # Unknown/unsupported element type; best-effort skip by bailing.
+                    raise ValueError("unsupported GGUF array element type")
+                skip_n(f, int(n) * int(sz))
+            return
+        # Unknown type
+        raise ValueError("unsupported GGUF value type")
+
+    try:
+        with open(model_path, "rb") as f:
+            magic = f.read(4)
+            if magic != b"GGUF":
+                return None
+            _version = read_u32(f)
+            _n_tensors = read_u64(f)
+            n_kv = read_u64(f)
+
+            for _i in range(int(n_kv)):
+                klen = read_u64(f)
+                key_bytes = f.read(int(klen))
+                if len(key_bytes) != int(klen):
+                    return None
+                key = key_bytes.decode("utf-8", errors="replace")
+                vtype = read_u32(f)
+
+                if key == want_key:
+                    if vtype == GGUF_TYPE_UINT32:
+                        return int(read_u32(f))
+                    if vtype == GGUF_TYPE_INT32:
+                        return int(read_i32(f))
+                    if vtype == GGUF_TYPE_UINT64:
+                        return int(read_u64(f))
+                    if vtype == GGUF_TYPE_INT64:
+                        return int(read_i64(f))
+                    # Not an int; skip and return None.
+                    skip_value(f, int(vtype))
+                    return None
+
+                # Skip value to reach next KV.
+                skip_value(f, int(vtype))
+
+    except Exception:
+        return None
+
+
 def find_free_port() -> int:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
@@ -240,6 +535,84 @@ def check_vram_available(min_free_mb: float) -> Tuple[bool, str]:
     if max_free < min_free_mb:
         return False, f"Insufficient free VRAM. Max free {max_free:.0f}MB < {min_free_mb:.0f}MB. " + "; ".join(details)
     return True, "; ".join(details)
+
+
+def get_max_free_vram_mb() -> Tuple[Optional[float], str]:
+    """Get the maximum free VRAM across all GPUs.
+    
+    Returns:
+        (max_free_mb, info_message) where max_free_mb is None if detection failed
+    """
+    gpus = get_gpu_metrics()
+    if not gpus:
+        return None, "No GPU metrics available (nvidia-smi/rocm-smi not found)."
+    
+    max_free_mb = 0.0
+    gpu_info = ""
+    for gpu in gpus:
+        if gpu.mem_total_mb is None or gpu.mem_used_mb is None:
+            continue
+        free_mb = gpu.mem_total_mb - gpu.mem_used_mb
+        if free_mb > max_free_mb:
+            max_free_mb = free_mb
+            gpu_info = f"GPU {gpu.index} {gpu.name}: {free_mb:.0f}MB free / {gpu.mem_total_mb:.0f}MB total"
+    
+    if max_free_mb == 0:
+        return None, "GPU memory metrics unavailable."
+    
+    return max_free_mb, gpu_info
+
+
+def recalculate_context_size(
+    current_context: int,
+    reserve_vram_mb: float = DEFAULT_VRAM_RESERVE_MB,
+    cache_type_k: str = "q8_0",
+    cache_type_v: str = "q8_0",
+    min_vram_threshold_mb: float = 1024.0,
+) -> Tuple[int, str]:
+    """Recalculate optimal context size based on ACTUAL remaining VRAM after model load.
+    
+    This function checks how much VRAM is actually free after the model has been loaded
+    and recalculates the optimal context size. If there's significantly more free VRAM
+    than expected, it will recommend a higher context size.
+    
+    Args:
+        current_context: The current context size being used
+        reserve_vram_mb: Minimum VRAM to keep free (for other GPU processes)
+        cache_type_k: KV cache type for K
+        cache_type_v: KV cache type for V
+        min_vram_threshold_mb: Minimum "wasted" VRAM before recommending increase
+        
+    Returns:
+        (recommended_context, message) - recommended_context may be same as current
+    """
+    max_free_mb, gpu_info = get_max_free_vram_mb()
+    if max_free_mb is None:
+        return current_context, f"Could not check VRAM: {gpu_info}"
+    
+    # Calculate how much VRAM we expected to reserve vs actual
+    vram_above_reserve = max_free_mb - reserve_vram_mb
+    
+    # If there's not much above reserve, keep current context
+    if vram_above_reserve < min_vram_threshold_mb:
+        return current_context, (
+            f"VRAM check: {max_free_mb:.0f}MB free (reserve: {reserve_vram_mb:.0f}MB). "
+            f"Current context {current_context:,} is appropriate. {gpu_info}"
+        )
+    
+    # Calculate how many additional tokens we could support with the free VRAM
+    kv_bytes_per_token = get_kv_cache_bytes_per_token(cache_type_k, cache_type_v)
+    memory_per_token_mb = 100 * kv_bytes_per_token / 1024.0
+    
+    # Calculate additional context possible with the "wasted" VRAM
+    additional_context = int((vram_above_reserve * 0.9) / memory_per_token_mb)
+    recommended_context = current_context + additional_context
+    
+    return recommended_context, (
+        f"VRAM optimization: {max_free_mb:.0f}MB free (reserve: {reserve_vram_mb:.0f}MB, "
+        f"wasted: {vram_above_reserve:.0f}MB). Can increase context from {current_context:,} "
+        f"to ~{recommended_context:,} tokens. {gpu_info}"
+    )
 
 
 @dataclass
@@ -397,8 +770,8 @@ class MetricsSampler:
         self._rapl_cpu = pick_rapl_domain(rapl, ["package-0", "package", "cpu", "core"])
         self._rapl_sys = pick_rapl_domain(rapl, ["psys", "platform", "system"])
 
-        if psutil is None:
-            require(psutil, "psutil")
+        # psutil is optional: without it we still sample /metrics and GPU.
+        self._have_psutil = psutil is not None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -461,13 +834,20 @@ class MetricsSampler:
             self._stop.wait(self.interval)
 
     def _collect_sample(self) -> Optional[Sample]:
-        if psutil is None:
-            return None
         ts = time.time()
-        cpu_percent = psutil.cpu_percent(interval=None)
-        mem = psutil.virtual_memory()
-        mem_percent = mem.percent
-        mem_used_mb = mem.used / (1024 * 1024)
+        cpu_percent = None
+        mem_percent = None
+        mem_used_mb = None
+        if psutil is not None:
+            try:
+                cpu_percent = psutil.cpu_percent(interval=None)
+                mem = psutil.virtual_memory()
+                mem_percent = mem.percent
+                mem_used_mb = mem.used / (1024 * 1024)
+            except Exception:
+                cpu_percent = None
+                mem_percent = None
+                mem_used_mb = None
         load1 = None
         try:
             load1 = os.getloadavg()[0]
@@ -477,13 +857,14 @@ class MetricsSampler:
         process_cpu = None
         process_rss = None
         if self.pid:
-            try:
-                proc = psutil.Process(self.pid)
-                process_cpu = proc.cpu_percent(interval=None)
-                process_rss = proc.memory_info().rss / (1024 * 1024)
-            except Exception:
-                process_cpu = None
-                process_rss = None
+            if psutil is not None:
+                try:
+                    proc = psutil.Process(self.pid)
+                    process_cpu = proc.cpu_percent(interval=None)
+                    process_rss = proc.memory_info().rss / (1024 * 1024)
+                except Exception:
+                    process_cpu = None
+                    process_rss = None
 
         gpus: List[GpuMetric] = []
         if self.include_gpu:
@@ -512,7 +893,7 @@ class MetricsSampler:
 
     def _fetch_tokens_total(self) -> Optional[float]:
         if requests is None:
-            require(requests, "requests")
+            return None
         if not self.metrics_url:
             return None
         try:
@@ -756,6 +1137,48 @@ def choose_token_metric(metrics: Dict[str, float]) -> Optional[str]:
     return None
 
 
+def get_cpu_info() -> Tuple[str, int]:
+    """Get CPU model name and core count using lscpu."""
+    cpu_name = "Unknown"
+    cpu_count = 0
+    
+    try:
+        # Use lscpu command to get CPU information
+        import subprocess
+        result = subprocess.run(
+            ["lscpu"],
+            capture_output=True,
+            text=True,
+            timeout=2.0
+        )
+        
+        if result.returncode == 0:
+            output = result.stdout
+            # Extract CPU model name
+            for line in output.splitlines():
+                line_lower = line.lower()
+                if line_lower.startswith("model name:"):
+                    # Get the CPU model name (after "model name:")
+                    cpu_name = line.split(":", 1)[1].strip()
+                    break
+            
+            # Extract CPU count
+            for line in output.splitlines():
+                line_lower = line.lower()
+                if line_lower.startswith("cpu(s):"):
+                    cpu_count = int(line.split(":", 1)[1].strip())
+                    break
+    except Exception:
+        pass
+    
+    if not cpu_name:
+        cpu_name = "Unknown"
+    if cpu_count <= 0:
+        cpu_count = 1
+    
+    return cpu_name, cpu_count
+
+
 def get_gpu_metrics() -> List[GpuMetric]:
     if which("nvidia-smi"):
         return _get_nvidia_metrics()
@@ -995,8 +1418,6 @@ def human_duration(seconds: float) -> str:
 
 
 # Context size calculation constants
-DEFAULT_VRAM_RESERVE_MB = 500  # Minimum VRAM to keep free
-
 # Memory per token by KV cache quantization (bytes per token)
 # Based on typical model architectures and KV cache memory usage
 KV_CACHE_BYTES_PER_TOKEN = {

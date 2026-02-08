@@ -117,6 +117,16 @@ class TokenMeter:
         with self.lock:
             return int(self.last_completion_tokens)
 
+    def get_total_used(self) -> int:
+        """Get total tokens used in current session (prompt + completion)."""
+        with self.lock:
+            return int(self.total_tokens)
+
+    def get_current_context(self) -> int:
+        """Get total tokens used in current request (prompt + completion)."""
+        with self.lock:
+            return int(self.last_prompt_tokens + self.last_completion_tokens)
+
 
 class ProxyHandler(BaseHTTPRequestHandler):
     # ThreadingHTTPServer
@@ -147,6 +157,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         self._handle()
 
+    def _is_streaming_response(self) -> bool:
+        """Check if the response will be streamed (Transfer-Encoding: chunked)."""
+        # llama.cpp typically uses chunked encoding for streaming
+        return self.headers.get("Transfer-Encoding", "").lower() == "chunked"
+
     def _handle(self) -> None:
         # Provide our own metrics endpoint so tools can always compute tok/s.
         if self.path == "/metrics":
@@ -168,7 +183,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         backend_host, backend_port = self.backend
         url = f"http://{backend_host}:{backend_port}{self.path}"
 
-        # Read body (buffered). This keeps proxy simple and works for bench + common clients.
+        # Read request body (buffered). This keeps proxy simple and works for bench + common clients.
         length = 0
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -202,18 +217,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        content = resp.content or b""
-
-        # Token metering (best-effort, non-stream JSON only)
-        if self.command == "POST" and resp.status_code == 200:
+        # Process streaming response if applicable
+        if self._is_streaming_response() and self.command == "POST" and resp.status_code == 200:
             if self.path.startswith("/v1/chat/completions") or self.path.startswith("/v1/completions"):
-                payload = _read_json_bytes(content)
-                if payload:
-                    tokens = _extract_tokens(payload)
-                    if tokens is not None:
-                        prompt_tokens, completion_tokens = tokens
-                        self.meter.add(prompt_tokens, completion_tokens)
+                self._process_streaming_response(resp)
+            else:
+                # Non-completion streaming endpoint
+                content_bytes = resp.content or b""
+                self._send_response(resp, content_bytes)
+        else:
+            # Non-streaming response
+            content_bytes = resp.content or b""
 
+            # Token metering (best-effort, non-stream JSON only)
+            if self.command == "POST" and resp.status_code == 200:
+                if self.path.startswith("/v1/chat/completions") or self.path.startswith("/v1/completions"):
+                    payload = _read_json_bytes(content_bytes)
+                    if payload:
+                        tokens = _extract_tokens(payload)
+                        if tokens is not None:
+                            prompt_tokens, completion_tokens = tokens
+                            self.meter.add(prompt_tokens, completion_tokens)
+
+            # Send response for non-streaming
+            self._send_response(resp, content_bytes)
+
+    def _send_response(self, resp, content_bytes: bytes) -> None:
+        """Send HTTP response to client."""
         self.send_response(resp.status_code)
         for k, v in resp.headers.items():
             if _is_hop_header(k):
@@ -224,10 +254,89 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if k.lower() == "content-length":
                 continue
             self.send_header(k, v)
-        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Length", str(len(content_bytes)))
         self.end_headers()
-        if content:
-            self.wfile.write(content)
+        if content_bytes:
+            self.wfile.write(content_bytes)
+
+    def _process_streaming_response(self, resp) -> None:
+        """Process streaming response and extract tokens from final message."""
+        content_parts = []
+        prompt_tokens = None
+        completion_tokens = None
+        has_seen_data_prefix = False
+
+        try:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    content_parts.append(chunk.decode("utf-8", errors="ignore"))
+                    self.wfile.write(chunk)
+
+                    # Try to parse SSE (Server-Sent Events) chunks
+                    chunk_text = chunk.decode("utf-8", errors="ignore")
+
+                    # Check if this chunk starts a new SSE message
+                    if chunk_text.startswith("data: "):
+                        # Split by "data: " to get individual messages
+                        messages = chunk_text.split("data: ")[1:]
+
+                        for msg in messages:
+                            msg = msg.strip()
+                            if not msg or msg == "[DONE]":
+                                continue
+
+                            try:
+                                payload = json.loads(msg)
+                                if payload.get("choices") and len(payload["choices"]) > 0:
+                                    choice = payload["choices"][0]
+                                    if "message" in choice:
+                                        # This might be a chat completion
+                                        continue
+                                    if "delta" in choice:
+                                        # This is a streaming chunk
+                                        delta = choice["delta"]
+                                        if "content" in delta:
+                                            # We're still streaming, continue collecting
+                                            continue
+
+                                    # Check for prompt_tokens in usage
+                                    if "usage" in choice and "prompt_tokens" in choice["usage"]:
+                                        prompt_tokens = choice["usage"]["prompt_tokens"]
+
+                                    # Check for completion_tokens in usage
+                                    if "usage" in choice and "completion_tokens" in choice["usage"]:
+                                        completion_tokens = choice["usage"]["completion_tokens"]
+                            except Exception:
+                                # Not a valid JSON chunk, skip
+                                continue
+
+            # After streaming completes, parse the full content if tokens not found
+            if prompt_tokens is None or completion_tokens is None:
+                full_content = "".join(content_parts)
+                if full_content:
+                    payload = _read_json_bytes(full_content.encode("utf-8"))
+                    if payload:
+                        tokens = _extract_tokens(payload)
+                        if tokens is not None:
+                            prompt_tokens, completion_tokens = tokens
+
+            # Add tokens to meter if found
+            if prompt_tokens is not None and completion_tokens is not None:
+                self.meter.add(prompt_tokens, completion_tokens)
+
+        except Exception:
+            # If streaming processing fails, try to parse the complete response
+            try:
+                content_bytes = resp.content or b""
+                if content_bytes:
+                    payload = _read_json_bytes(content_bytes)
+                    if payload:
+                        tokens = _extract_tokens(payload)
+                        if tokens is not None:
+                            prompt_tokens, completion_tokens = tokens
+                            self.meter.add(prompt_tokens, completion_tokens)
+            except Exception:
+                pass
 
 
 class LlamaMeterProxy:

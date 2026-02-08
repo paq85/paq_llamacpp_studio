@@ -2,6 +2,8 @@
 
 Complete automation and documentation for llama.cpp Studio with GLM-4.7 Flash.
 
+**Author**: Damian Sromek
+
 ## Project Structure
 
 ```

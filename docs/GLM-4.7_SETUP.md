@@ -412,9 +412,15 @@ For additional support:
 
 ## Additional Resources
 
+- [Unsloth GLM-4.7 Flash Documentation](https://unsloth.ai/docs/models/glm-4.7-flash)
+- [Unsloth Claude Codex Integration Guide](https://unsloth.ai/docs/basics/claude-codex)
 - [llama.cpp Documentation](https://github.com/ggerganov/llama.cpp)
 - [GLM-4 Paper](https://arxiv.org/abs/2403.13872)
 - [Hugging Face Models](https://huggingface.co/THUDM)
+
+## Credits
+
+Special thanks to the creators of Unsloth for their optimization and documentation of GLM-4.7 Flash models.
 
 ## Next Steps
 

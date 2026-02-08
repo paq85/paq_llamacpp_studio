@@ -1,0 +1,35 @@
+---
+name: Question
+about: Ask a question about LlamaCPP Studio
+title: '[QUESTION] '
+labels: question
+assignees: ''
+---
+
+**Describe your question**
+
+A clear and concise description of what you're asking.
+
+**Environment**
+
+- OS: [e.g., Ubuntu 22.04]
+- Python Version: [e.g., 3.9.7]
+- GPU: [e.g., NVIDIA RTX 3080]
+
+**Relevant logs**
+
+If applicable, paste any relevant logs or outputs here:
+
+```
+Paste logs or outputs here
+```
+
+**Additional context**
+
+Add any other context about your question here.
+
+**Steps to reproduce (if applicable)**
+
+1. Step 1
+2. Step 2
+3. Step 3

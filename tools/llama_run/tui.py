@@ -21,7 +21,10 @@ class TuiState:
     paused: bool = False
     last_error: Optional[str] = None
     max_context_size: int = 0
-    last_prompt_tokens: int = 0
+    # Tokens used by the most recent request (prompt + generated).
+    # Prefer proxy metering when available; otherwise fall back to parsing llama-server logs.
+    last_ctx_tokens: int = 0
+    system_info: str = ""
 
 
 def _clamp(n: int, lo: int, hi: int) -> int:
@@ -175,12 +178,12 @@ def _draw(stdscr, state: TuiState) -> None:
 
     # Context usage display
     bar_w = max(10, min(40, w - 30))
-    ctx_bar = _ctx_bar(state.last_prompt_tokens, state.max_context_size, bar_w)
+    ctx_bar = _ctx_bar(state.last_ctx_tokens, state.max_context_size, bar_w)
     _safe_add(
         stdscr,
         3,
         0,
-        f"context usage: [{ctx_bar}] {_fmt_ctx_usage(state.last_prompt_tokens, state.max_context_size)}",
+        f"context usage: [{ctx_bar}] {_fmt_ctx_usage(state.last_ctx_tokens, state.max_context_size)}",
     )
 
     # Window table (performance)
@@ -226,6 +229,20 @@ def _draw(stdscr, state: TuiState) -> None:
     _safe_add(stdscr, 12, 0, f"mem  [{mem_bar}] {_fmt_pct(now_sum.avg_mem_percent)}")
     _safe_add(stdscr, 13, 0, f"gpu  [{gpu_bar}] {_fmt_pct(now_sum.avg_gpu_util)}")
     _safe_add(stdscr, 14, 0, f"gcap [{gpu_cap_bar}] {_fmt_pct(now_sum.avg_gpu_power_percent_of_limit)}")
+
+    # System info footer
+    sys_info = state.system_info
+    if sys_info:
+        max_info_width = max(0, w - 2)
+        if len(sys_info) <= max_info_width:
+            _safe_add(stdscr, h - 3, 0, sys_info[: max_info_width], curses.A_BOLD)
+        else:
+            # Truncate if too long
+            truncated = sys_info[: max_info_width]
+            # Add "..." if truncated
+            if len(sys_info) > max_info_width:
+                truncated = truncated[:-3] + "..."
+            _safe_add(stdscr, h - 3, 0, truncated, curses.A_BOLD)
 
     # Energy/power (window)
     pc_tag = "pc" if all_sum.pc_energy_source != "estimated" else "pc*"
@@ -274,7 +291,7 @@ def run_tui(state: TuiState, stop_cb, alive_cb, proxy=None) -> int:
     """Blocking curses UI loop.
 
     stop_cb() is invoked when the user requests exit.
-    proxy is optional LlamaMeterProxy to read last prompt tokens.
+    proxy is optional LlamaMeterProxy to read context usage (prompt + completion tokens).
     """
 
     def _main(stdscr) -> int:
@@ -303,9 +320,21 @@ def run_tui(state: TuiState, stop_cb, alive_cb, proxy=None) -> int:
                     state.paused = not state.paused
 
             if not state.paused:
-                # Update last prompt tokens from proxy if available
+                # Update context usage (prompt + completion tokens).
+                # - Best: proxy can read exact usage fields for non-stream requests.
+                # - Fallback: use the most recent llama-server log perf sample.
+                ctx = 0
                 if proxy is not None:
-                    state.last_prompt_tokens = proxy.meter.get_last_prompt()
+                    try:
+                        ctx = int(proxy.meter.get_current_context())
+                    except Exception:
+                        ctx = 0
+                if ctx <= 0:
+                    try:
+                        ctx = int(state.perf.last().total_tokens)
+                    except Exception:
+                        ctx = 0
+                state.last_ctx_tokens = max(0, int(ctx))
                 _draw(stdscr, state)
 
     return curses.wrapper(_main)
